@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::ffi::OsStr;
 use std::io::Result;
@@ -257,6 +258,8 @@ fn visit_path(args: &PutzenCliArgs) -> Result<()> {
     let to_clean = Arc::clone(&rules);
     let mut decider = NiceInteractiveDecider::default();
     let mut amount_cleaned = 0;
+    // with `-L` the same folder can be reached via several paths
+    let mut seen = HashSet::new();
     let folder = args
         .folder
         .canonicalize()
@@ -298,11 +301,12 @@ fn visit_path(args: &PutzenCliArgs) -> Result<()> {
         .follow_links(args.follow)
         .parallelism(Parallelism::RayonNewPool(8))
         .process_read_dir(move |depth, _, _, children| {
-            // 1. keep only directories
+            // 1. keep only directories; jwalk resolves symlinks in `file_type` only
+            // with `-L`, otherwise e.g. a `lib -> .libs` link would match `.libs` twice
             children.retain(|dir_entry_result| {
                 dir_entry_result
                     .as_ref()
-                    .map(|dir| dir.path().is_dir())
+                    .map(|dir| dir.file_type().is_dir())
                     .unwrap_or(false)
             });
 
@@ -343,6 +347,9 @@ fn visit_path(args: &PutzenCliArgs) -> Result<()> {
         .filter_map(|f| f.ok())
         .filter_map(|f| f.client_state)
     {
+        if !seen.insert(folder.as_ref().to_path_buf()) || !folder.as_ref().exists() {
+            continue;
+        }
         match folder.accept(&ctx, &*rules[rule], &*cleaner, &mut decider, &mut *observer)? {
             FolderProcessed::Abort => return Ok(()),
             FolderProcessed::Cleaned(size) => amount_cleaned += size,
@@ -460,6 +467,28 @@ mod tests {
         assert!(!libs.exists());
         assert!(app.join("build.gradle").exists());
         assert!(cache.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_artefact_folder_is_cleaned_once() {
+        let root = tempfile::TempDir::new().unwrap();
+        // libtool projects often ship `lib -> .libs`
+        let libs = root.path().join(".libs");
+        std::fs::create_dir_all(&libs).unwrap();
+        std::fs::File::create(root.path().join("Makefile.am")).unwrap();
+        std::fs::File::create(libs.join("libprime_server.so")).unwrap();
+        std::os::unix::fs::symlink(".libs/", root.path().join("lib")).unwrap();
+
+        for follow in [false, true] {
+            std::fs::create_dir_all(&libs).unwrap();
+            let args = PutzenCliArgs {
+                follow,
+                ..args_for(root.path(), false)
+            };
+            visit_path(&args).unwrap();
+            assert!(!libs.exists(), "follow={follow}");
+        }
     }
 
     #[test]
