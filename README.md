@@ -37,6 +37,13 @@ putzen supports cleaning artifacts for:
 | rust       | Cargo.toml           | target                 |
 | javascript | package.json         | node_modules           |
 | CMake      | CMakeLists.txt       | build                  |
+| gradle     | build.gradle(.kts)   | build, .externalNativeBuild, .cxx |
+| libtool    | Makefile.am / Makefile.in | .libs             |
+
+With `--build-dirs`, putzen also cleans folders that look like build folders
+(`build`, `build-*`, `_build`, `builddir`, `cmake-build-*`, `out`, `obj`, `Debug`, `Release`, `Release-x64`, ...)
+when they contain build system files (`CMakeCache.txt`, `build.ninja`, `config.status`, `meson-info`, ...)
+or compiler outputs (`*.o`, `*.a`, `*.so`, `*.lo`, `*.la`), and none of their files are tracked by git.
 
 furthermore, it does also support:
 - It can do run a dry-run (`-d`)

@@ -2,6 +2,7 @@ use std::convert::TryFrom;
 use std::ffi::OsStr;
 use std::io::Result;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use argh::FromArgs;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -9,8 +10,8 @@ use jwalk::Parallelism;
 
 use putzen_cli::caches;
 use putzen_cli::{
-    DecisionContext, DoCleanUp, DryRunCleaner, FileToFolderMatch, Folder, FolderProcessed,
-    HumanReadable, IsFolderToRemove, NiceInteractiveDecider, NoOpObserver, ProperCleaner,
+    BuildDirHeuristic, CleanupRule, DecisionContext, DoCleanUp, DryRunCleaner, FileToFolderMatch,
+    Folder, FolderProcessed, HumanReadable, NiceInteractiveDecider, NoOpObserver, ProperCleaner,
     RunObserver,
 };
 
@@ -112,14 +113,27 @@ impl HiddenPolicy {
 }
 
 /// all supported this to clean up
-static FOLDER_TO_CLEANUP: [FileToFolderMatch; 3] = [
+static FOLDER_TO_CLEANUP: [FileToFolderMatch; 11] = [
     FileToFolderMatch::new("Cargo.toml", "target"),
     FileToFolderMatch::new("package.json", "node_modules"),
     FileToFolderMatch::new("CMakeLists.txt", "build"),
+    FileToFolderMatch::new("build.gradle", "build"),
+    FileToFolderMatch::new("build.gradle", ".externalNativeBuild"),
+    FileToFolderMatch::new("build.gradle", ".cxx"),
+    FileToFolderMatch::new("build.gradle.kts", "build"),
+    FileToFolderMatch::new("build.gradle.kts", ".externalNativeBuild"),
+    FileToFolderMatch::new("build.gradle.kts", ".cxx"),
+    FileToFolderMatch::new("Makefile.am", ".libs"),
+    FileToFolderMatch::new("Makefile.in", ".libs"),
 ];
 
 #[derive(FromArgs)]
 /// help keeping your disk clean of build and dependency artifacts
+///
+/// With `--build-dirs`, folders named like build folders (`build`, `out`,
+/// `obj`, `Debug`, `Release-x64`, ...) are cleaned as well, if they contain
+/// build system files or compiler outputs (`*.o`, `*.a`, `*.so`, ...) and
+/// nothing in them is tracked by git.
 ///
 /// Hidden directories are normally skipped, except for `.worktrees`
 /// (so colocated git worktrees are cleaned alongside the main checkout).
@@ -161,6 +175,11 @@ struct PutzenCliArgs {
     /// skip every hidden directory (overrides the default `.worktrees`)
     #[argh(switch)]
     no_hidden: bool,
+
+    /// also clean folders that look like build folders and contain
+    /// compiler outputs, see above
+    #[argh(switch)]
+    build_dirs: bool,
 
     /// glob of hidden directories to descend into (repeatable). Match is
     /// against the full basename including the leading dot, e.g.
@@ -226,7 +245,16 @@ fn main() -> Result<()> {
 }
 
 fn visit_path(args: &PutzenCliArgs) -> Result<()> {
-    let to_clean = &FOLDER_TO_CLEANUP;
+    // the heuristic goes last, so the explicit "File" -> "Folder" rules take precedence
+    let mut rules: Vec<Box<dyn CleanupRule>> = FOLDER_TO_CLEANUP
+        .iter()
+        .map(|rule| Box::new(rule) as Box<dyn CleanupRule>)
+        .collect();
+    if args.build_dirs {
+        rules.push(Box::new(BuildDirHeuristic::default()));
+    }
+    let rules = Arc::new(rules);
+    let to_clean = Arc::clone(&rules);
     let mut decider = NiceInteractiveDecider::default();
     let mut amount_cleaned = 0;
     let folder = args
@@ -261,37 +289,16 @@ fn visit_path(args: &PutzenCliArgs) -> Result<()> {
     let hidden_policy = HiddenPolicy::from_args(args)
         .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
 
-    // When --no-hidden is set, let jwalk drop hidden entries natively;
-    // otherwise we keep them all and let `hidden_policy` decide in the closure.
-    let jwalk_skip_hidden = args.no_hidden;
-
     ctx.println(format!("Start cleaning at {}", folder.display()));
-    for folder in jwalk::WalkDirGeneric::<((), Option<Folder>)>::new(folder)
-        .skip_hidden(jwalk_skip_hidden)
+    // Hidden entries are never dropped by jwalk itself: hidden artefact folders
+    // like `.libs` or `.externalNativeBuild` must be seen by the rules first,
+    // `hidden_policy` only decides about descending into the remaining ones.
+    for (folder, rule) in jwalk::WalkDirGeneric::<((), Option<(Folder, usize)>)>::new(folder)
+        .skip_hidden(false)
         .follow_links(args.follow)
         .parallelism(Parallelism::RayonNewPool(8))
         .process_read_dir(move |depth, _, _, children| {
-            // 1. drop hidden children disallowed by the policy.
-            // depth=None is the virtual root call (parent of the starting dir);
-            // we must NOT filter those children or we'd block the starting dir itself.
-            // When `--no-hidden` is in effect, jwalk's own `skip_hidden(true)`
-            // has already dropped them, so we can skip this pass entirely.
-            if depth.is_some() && !hidden_policy.no_hidden {
-                children.retain(|dir_entry_result| {
-                    let Ok(dir) = dir_entry_result else {
-                        return true;
-                    };
-                    let name = dir.file_name();
-                    // byte-level check: works for non-UTF-8 names too, and `.` is always ASCII
-                    let is_hidden = name.as_encoded_bytes().first() == Some(&b'.');
-                    if !is_hidden {
-                        return true;
-                    }
-                    hidden_policy.allows_hidden(name)
-                });
-            }
-
-            // 2. keep only directories
+            // 1. keep only directories
             children.retain(|dir_entry_result| {
                 dir_entry_result
                     .as_ref()
@@ -299,37 +306,47 @@ fn visit_path(args: &PutzenCliArgs) -> Result<()> {
                     .unwrap_or(false)
             });
 
-            // 3. existing build-artefact marking
+            // 2. build-artefact marking, matched folders are not descended into
             children.iter_mut().for_each(|child| {
                 if let Ok(child) = child {
                     if let Ok(folder) = Folder::try_from(child.path()) {
-                        for rule in to_clean {
-                            if rule.is_folder_to_remove(&folder) {
-                                child.client_state = Some(folder);
-                                child.read_children_path = None;
-                                return;
-                            }
+                        if let Some(i) = to_clean
+                            .iter()
+                            .position(|rule| rule.match_folder(&folder).is_some())
+                        {
+                            child.client_state = Some((folder, i));
+                            child.read_children_path = None;
                         }
                     }
                 }
             });
+
+            // 3. drop unmarked hidden children disallowed by the policy.
+            // depth=None is the virtual root call (parent of the starting dir);
+            // we must NOT filter those children or we'd block the starting dir itself.
+            if depth.is_some() {
+                children.retain(|dir_entry_result| {
+                    let Ok(dir) = dir_entry_result else {
+                        return true;
+                    };
+                    if dir.client_state.is_some() {
+                        return true;
+                    }
+                    let name = dir.file_name();
+                    // byte-level check: works for non-UTF-8 names too, and `.` is always ASCII
+                    let is_hidden = name.as_encoded_bytes().first() == Some(&b'.');
+                    !is_hidden || hidden_policy.allows_hidden(name)
+                });
+            }
         })
         .into_iter()
         .filter_map(|f| f.ok())
         .filter_map(|f| f.client_state)
     {
-        'rules: for rule in to_clean {
-            let result = folder.accept(&ctx, rule, &*cleaner, &mut decider, &mut *observer);
-            match result {
-                Ok(FolderProcessed::Abort) => return Ok(()),
-                Ok(FolderProcessed::Cleaned(size)) => {
-                    amount_cleaned += size;
-                    continue 'rules;
-                }
-                Ok(FolderProcessed::NoRuleMatch) => continue 'rules,
-                Ok(FolderProcessed::Skipped) => continue 'rules,
-                Err(error) => return Err(error),
-            };
+        match folder.accept(&ctx, &*rules[rule], &*cleaner, &mut decider, &mut *observer)? {
+            FolderProcessed::Abort => return Ok(()),
+            FolderProcessed::Cleaned(size) => amount_cleaned += size,
+            FolderProcessed::NoRuleMatch | FolderProcessed::Skipped => {}
         }
     }
 
@@ -383,6 +400,7 @@ mod tests {
             follow: false,
             dive_into_hidden_folders: false,
             no_hidden: false,
+            build_dirs: false,
             hidden: Vec::new(),
             folder: root_folder.path().to_path_buf(),
         };
@@ -396,6 +414,97 @@ mod tests {
         assert!(root_folder.path().join("Cargo.toml").exists());
         assert!(root_folder.path().join("package.json").exists());
         assert!(second_node_root_folder.join("package.json").exists());
+    }
+
+    fn args_for(folder: &std::path::Path, build_dirs: bool) -> PutzenCliArgs {
+        PutzenCliArgs {
+            version: false,
+            #[cfg(feature = "highscore-board")]
+            scores: false,
+            dry_run: false,
+            yes_to_all: true,
+            follow: false,
+            dive_into_hidden_folders: false,
+            no_hidden: false,
+            build_dirs,
+            hidden: Vec::new(),
+            folder: folder.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn hidden_artefact_folders_are_cleaned() {
+        let root = tempfile::TempDir::new().unwrap();
+
+        // android: app/{build.gradle,.externalNativeBuild}
+        let app = root.path().join("app");
+        let native_build = app.join(".externalNativeBuild");
+        std::fs::create_dir_all(&native_build).unwrap();
+        std::fs::File::create(app.join("build.gradle")).unwrap();
+        std::fs::File::create(native_build.join("libnative.so")).unwrap();
+
+        // libtool: lib/{Makefile.in,.libs}
+        let lib = root.path().join("lib");
+        let libs = lib.join(".libs");
+        std::fs::create_dir_all(&libs).unwrap();
+        std::fs::File::create(lib.join("Makefile.in")).unwrap();
+        std::fs::File::create(libs.join("liblwgeom.a")).unwrap();
+
+        // hidden folder without a matching rule stays untouched
+        let cache = root.path().join(".cache");
+        std::fs::create_dir_all(&cache).unwrap();
+
+        visit_path(&args_for(root.path(), false)).unwrap();
+
+        assert!(!native_build.exists());
+        assert!(!libs.exists());
+        assert!(app.join("build.gradle").exists());
+        assert!(cache.exists());
+    }
+
+    #[test]
+    fn build_dirs_are_only_cleaned_when_enabled() {
+        let root = tempfile::TempDir::new().unwrap();
+        let out = root.path().join("v8").join("out");
+        std::fs::create_dir_all(out.join("x64.release")).unwrap();
+        std::fs::File::create(out.join("x64.release").join("libv8.a")).unwrap();
+
+        visit_path(&args_for(root.path(), false)).unwrap();
+        assert!(out.exists(), "heuristic must be opt-in");
+
+        visit_path(&args_for(root.path(), true)).unwrap();
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn build_dirs_descends_into_tracked_build_folder() {
+        let root = tempfile::TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root.path())
+                .args(args)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !git(&["init", "-q"]) {
+            eprintln!("git not available, skipping");
+            return;
+        }
+
+        // like tracy: profiler/build holds tracked project files,
+        // the actual build output lives in profiler/build/unix/obj
+        let build = root.path().join("profiler").join("build");
+        let obj = build.join("unix").join("obj");
+        std::fs::create_dir_all(&obj).unwrap();
+        std::fs::File::create(build.join("unix").join("Makefile")).unwrap();
+        assert!(git(&["add", "."]));
+        std::fs::File::create(obj.join("TracyWorker.o")).unwrap();
+
+        visit_path(&args_for(root.path(), true)).unwrap();
+
+        assert!(build.join("unix").join("Makefile").exists());
+        assert!(!obj.exists());
     }
 
     #[test]
@@ -619,6 +728,7 @@ mod tests {
             follow: false,
             dive_into_hidden_folders: false,
             no_hidden: false,
+            build_dirs: false,
             hidden: Vec::new(),
             folder: root.path().to_path_buf(),
         };
@@ -655,6 +765,7 @@ mod tests {
             follow: false,
             dive_into_hidden_folders: false,
             no_hidden: true,
+            build_dirs: false,
             hidden: Vec::new(),
             folder: root.path().to_path_buf(),
         };

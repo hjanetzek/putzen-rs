@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod build_dir;
 mod cleaner;
 mod decider;
 #[cfg(feature = "highscore-board")]
@@ -8,6 +9,7 @@ mod observer;
 #[cfg(feature = "highscore-board")]
 pub use crate::highscore::{render_board, HighscoreObserver, Highscores};
 
+pub use crate::build_dir::BuildDirHeuristic;
 pub use crate::cleaner::*;
 pub use crate::decider::*;
 pub use crate::observer::*;
@@ -60,15 +62,15 @@ impl Folder {
     pub fn accept(
         &self,
         ctx: &DecisionContext,
-        rule: &FileToFolderMatch,
+        rule: &dyn CleanupRule,
         cleaner: &dyn DoCleanUp,
         decider: &mut impl Decide,
         observer: &mut dyn RunObserver,
     ) -> Result<FolderProcessed> {
         // better double check here
-        if !rule.is_folder_to_remove(self) {
+        let Some(reason) = rule.match_folder(self) else {
             return Ok(FolderProcessed::NoRuleMatch);
-        }
+        };
 
         let size_amount = self.calculate_size();
         let size = size_amount.as_human_readable();
@@ -87,10 +89,7 @@ impl Folder {
             });
 
         ctx.println(format!("Cleaning {folder} with {size}"));
-        ctx.println(format!(
-            "  ├─ because of {}",
-            PathBuf::from("..").join(rule.file_to_check).display()
-        ));
+        ctx.println(format!("  ├─ because {reason}"));
 
         let result = match decider.obtain_decision(ctx, "├─ delete directory recursively?") {
             Ok(Decision::Yes) => match cleaner.do_cleanup(self.as_ref())? {
@@ -228,12 +227,35 @@ impl IsFolderToRemove for FileToFolderMatch {
         folder.as_ref().parent().map_or_else(
             || false,
             |parent| {
-                parent.join(self.file_to_check).exists()
-                    && parent
-                        .join(self.folder_to_remove)
-                        .starts_with(folder.as_ref())
+                parent
+                    .join(self.folder_to_remove)
+                    .starts_with(folder.as_ref())
+                    && parent.join(self.file_to_check).exists()
             },
         )
+    }
+}
+
+/// A rule that decides if a folder is a build or dependency artefact folder that can be removed.
+pub trait CleanupRule: Send + Sync {
+    /// Returns the reason why `folder` should be removed, or `None` if the rule does not apply.
+    fn match_folder(&self, folder: &Folder) -> Option<String>;
+}
+
+impl<T: CleanupRule + ?Sized> CleanupRule for &T {
+    fn match_folder(&self, folder: &Folder) -> Option<String> {
+        (**self).match_folder(folder)
+    }
+}
+
+impl CleanupRule for FileToFolderMatch {
+    fn match_folder(&self, folder: &Folder) -> Option<String> {
+        self.is_folder_to_remove(folder).then(|| {
+            format!(
+                "of {}",
+                PathBuf::from("..").join(self.file_to_check).display()
+            )
+        })
     }
 }
 
